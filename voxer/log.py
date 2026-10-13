@@ -14,11 +14,11 @@ import sys
 
 import colorlog
 
-from .config import LOG_LEVEL
+from . import config
 
 _CREDENTIAL_RE = re.compile(
     r"(?i)(\b(?:bearer|oauth)\s*[: ]\s*|"
-    r"\b(?:access_token|refresh_token|client_secret|authorization|token)"
+    r"\b(?:access_token|refresh_token|client_secret|authorization|token|refresh|secret|code|state|key)"
     r"[\"']?\s*[:=]\s*[\"']?(?:(?:bearer|oauth)\s+)?)([^\s\"'&,;}]+)"
 )
 
@@ -31,7 +31,7 @@ class RedactingFormatter(colorlog.ColoredFormatter):
         return _CREDENTIAL_RE.sub(lambda match: match.group(1) + "[REDACTED]", rendered)
 
 
-def setup_logging(level: str = LOG_LEVEL) -> None:
+def setup_logging(level: str | None = None) -> None:
     """Configure coloured logging with timestamp and module names.
 
     Called once at startup by voxer/app.py::run() before any other component
@@ -49,6 +49,7 @@ def setup_logging(level: str = LOG_LEVEL) -> None:
     # and root.setLevel() then raised on it.  A plain typo like "INF0" was worse
     # in the other direction: it silently became INFO with nothing to show that
     # the setting had been ignored.
+    level = level if level is not None else str(config.LOG_LEVEL)
     resolved = logging.getLevelNamesMapping().get(level)
     if resolved is None:
         # Deliberately print() and not logging.warning(): the root logger is

@@ -9,11 +9,10 @@ This module is intentionally thin: it translates raw Twitch events into
 QueuedMessages and drops them onto the shared asyncio.Queue.  All business
 logic (voice selection, TTS synthesis, language detection) lives in handler.py.
 
-Subscriptions are registered via subscribe_for(), which is called:
-  - from event_oauth_authorized, when a broadcaster completes the OAuth flow
-    via the twitchio built-in /oauth route, and
-  - from the composition root on every startup for the bot's own channel
-    (Conduit subscriptions expire after 72h of downtime).
+Subscriptions are registered by the composition root once per startup through
+subscribe_for(). OAuth callbacks only admit and persist grants. Conduit
+subscriptions expire after 72h of downtime, so startup registration also repairs
+long gaps.
 
 Authentication uses twitchio's built-in web adapter: /oauth starts the Twitch
 authorization redirect and /oauth/callback receives the granted code.  Tokens
@@ -25,7 +24,7 @@ import logging
 import time
 import webbrowser
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Final
 from urllib.parse import urlsplit
 
@@ -55,9 +54,11 @@ from .events import (
     sub_message,
 )
 from .models import MessageKind, QueuedMessage
+from .lifecycle import retry_provider, transient
 from .oauth import SecureOAuthAdapter
 from .soundboard import resolve_sound
 from .token_store import TokenFileLock, read_tokens, write_json_atomic
+from .twitch_transport import install_form_oauth
 
 LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -213,7 +214,9 @@ def _display_name(user: PartialUser) -> str:
     return user.name or _UNKNOWN_USER
 
 
-async def get_user_id(username: str) -> str:
+async def get_user_id(
+    username: str, settings: config.RuntimeSettings | None = None
+) -> str:
     """Fetch Twitch user ID by login name.
 
     Opens a short-lived API client, makes one GET /users call, then closes.
@@ -228,12 +231,14 @@ async def get_user_id(username: str) -> str:
     Raises:
         ValueError: If user not found.
     """
+    values = settings or config
     async with Client(
-        client_id=config.CLIENT_ID, client_secret=config.CLIENT_SECRET
+        client_id=values.CLIENT_ID, client_secret=values.CLIENT_SECRET
     ) as client:
         # load_tokens/save_tokens off: this throwaway client only needs an app
         # token, and the defaults would read AND rewrite ".tio.tokens.json" in
         # the working directory — a file this project never uses.
+        install_form_oauth(client)
         await client.login(load_tokens=False, save_tokens=False)
         users = await client.fetch_users(logins=[username])
         if not users:
@@ -255,8 +260,11 @@ class VoxBot(commands.AutoBot):
         *,
         bot_id: str,
         message_queue: asyncio.Queue["QueuedMessage"],
-        max_message_chars: int = config.MAX_MESSAGE_CHARS,
-        user_cooldown_secs: float = config.USER_COOLDOWN_SECS,
+        max_message_chars: int | None = None,
+        user_cooldown_secs: float | None = None,
+        token_owner: TokenFileLock | None = None,
+        settings: config.RuntimeSettings | None = None,
+        adapter: AiohttpAdapter | None = None,
     ) -> None:
         """Initialize the Twitch bot with its message queue.
 
@@ -264,7 +272,13 @@ class VoxBot(commands.AutoBot):
             bot_id: Twitch user ID of the bot account.
             message_queue: Queue for dispatching chat messages to the handler.
         """
+        self._settings = settings
+        self._closing = False
         self._message_queue = message_queue
+        if max_message_chars is None:
+            max_message_chars = int(self._runtime.MAX_MESSAGE_CHARS)
+        if user_cooldown_secs is None:
+            user_cooldown_secs = float(self._runtime.USER_COOLDOWN_SECS)
         if max_message_chars < 1 or user_cooldown_secs < 0:
             raise ValueError("Message limit must be positive and cooldown nonnegative")
         self._max_message_chars = max_message_chars
@@ -275,7 +289,8 @@ class VoxBot(commands.AutoBot):
         self._avatar_pending: set[str] = set()
         self._seen_events: OrderedDict[str, float] = OrderedDict()
         self._user_last_message: OrderedDict[str, float] = OrderedDict()
-        self._token_owner: TokenFileLock | None = None
+        self._token_owner: TokenFileLock | None = token_owner
+        self._owns_token_lock = token_owner is None
         self._token_save_lock = asyncio.Lock()
         self._token_admission_lock = asyncio.Lock()
         # Set once a user token for the bot's own account is available (loaded
@@ -284,8 +299,8 @@ class VoxBot(commands.AutoBot):
         # components start.
         self.bot_authorized: asyncio.Event = asyncio.Event()
         super().__init__(
-            client_id=config.CLIENT_ID,
-            client_secret=config.CLIENT_SECRET,
+            client_id=self._runtime.CLIENT_ID,
+            client_secret=self._runtime.CLIENT_SECRET,
             bot_id=bot_id,
             owner_id=bot_id,
             prefix="!",
@@ -300,11 +315,15 @@ class VoxBot(commands.AutoBot):
             # The registered redirect URL is configured as one env var
             # (VOXER_OAUTH_REDIRECT_URL) and split into the domain/path
             # arguments the adapter expects.
-            adapter=self._build_adapter(bot_id),
+            adapter=adapter or self._build_adapter(bot_id),
         )
+        install_form_oauth(self)
 
-    @staticmethod
-    def _build_adapter(bot_id: str) -> AiohttpAdapter:
+    @property
+    def _runtime(self):
+        return getattr(self, "_settings", None) or config
+
+    def _build_adapter(self, bot_id: str) -> AiohttpAdapter:
         """Build the OAuth web adapter from the configured redirect URL.
 
         config.OAUTH_REDIRECT_URL (env VOXER_OAUTH_REDIRECT_URL) is the single
@@ -312,12 +331,13 @@ class VoxBot(commands.AutoBot):
         split into the domain/redirect_path arguments the adapter expects.
         """
         return SecureOAuthAdapter(
-            redirect_url=config.OAUTH_REDIRECT_URL,
+            redirect_url=self._runtime.OAUTH_REDIRECT_URL,
             expected_user_id=bot_id,
-            client_id=config.CLIENT_ID,
+            client_id=self._runtime.CLIENT_ID,
             scopes=OAUTH_SCOPES,
-            host=config.OAUTH_HOST,
-            port=config.OAUTH_PORT,
+            host=self._runtime.OAUTH_HOST,
+            port=self._runtime.OAUTH_PORT,
+            authorize=self.event_oauth_authorized,
         )
 
     # ── Token persistence ─────────────────────────────────────────────────────
@@ -327,7 +347,7 @@ class VoxBot(commands.AutoBot):
 
     async def load_tokens(self, path: str | None = None, /) -> None:
         """Load stored user tokens from the configured token file."""
-        target = path or config.TOKEN_FILE
+        target = path or self._runtime.TOKEN_FILE
         if self._token_owner is None:
             self._token_owner = TokenFileLock(target)
             self._token_owner.acquire()
@@ -345,13 +365,20 @@ class VoxBot(commands.AutoBot):
         if not isinstance(token, str) or not isinstance(refresh, str):
             return
         try:
-            await self.add_token(token, refresh)
-        except Exception:
-            LOGGER.warning(
-                "Stored Twitch token is invalid or lacks required permissions"
-            )
+            await retry_provider(lambda: self.add_token(token, refresh))
+        except (ValueError, twitchio.HTTPException) as exc:
+            if transient(exc):
+                raise
+            if isinstance(exc, twitchio.HTTPException) and exc.status not in (
+                400,
+                401,
+                403,
+            ):
+                raise
+            LOGGER.warning("Stored Twitch token requires renewed permissions")
         else:
             await self.save_tokens(target)
+            self.bot_authorized.set()
 
     async def save_tokens(self, path: str | None = None, /) -> None:
         """Persist all user tokens to the configured token file."""
@@ -359,12 +386,14 @@ class VoxBot(commands.AutoBot):
             tokens = {key: dict(value) for key, value in self.tokens.items()}
             if not tokens:
                 return
-            target = path or config.TOKEN_FILE
+            target = path or self._runtime.TOKEN_FILE
             if self._token_owner is None:
                 self._token_owner = TokenFileLock(target)
                 self._token_owner.acquire()
+            persisted = await asyncio.to_thread(read_tokens, target)
+            persisted.update(tokens)
             task = asyncio.create_task(
-                asyncio.to_thread(write_json_atomic, target, tokens)
+                asyncio.to_thread(write_json_atomic, target, persisted)
             )
             try:
                 await asyncio.shield(task)
@@ -374,10 +403,11 @@ class VoxBot(commands.AutoBot):
 
     async def close(self, **kwargs: object) -> None:
         """Release credential ownership only after TwitchIO finishes saving."""
+        self._closing = True
         try:
             await super().close(**kwargs)
         finally:
-            if self._token_owner is not None:
+            if self._token_owner is not None and self._owns_token_lock:
                 self._token_owner.close()
 
     async def event_token_refreshed(self, _payload: object) -> None:
@@ -387,7 +417,8 @@ class VoxBot(commands.AutoBot):
         immediately means a crash never strands a stale refresh token on disk,
         which would force the user back through the browser flow.
         """
-        await self.save_tokens()
+        if not self._closing:
+            await self.save_tokens()
 
     def _has_user_token(self) -> bool:
         """Return True when the managed token store holds a token for the bot account.
@@ -409,18 +440,35 @@ class VoxBot(commands.AutoBot):
              and waits until event_oauth_authorized fires for the bot account.
         """
         if self._has_user_token():
-            LOGGER.info("Using stored token from %s", config.TOKEN_FILE)
-            self.bot_authorized.set()
+            LOGGER.info("Using stored token from %s", self._runtime.TOKEN_FILE)
+            if not self.bot_authorized.is_set():
+                # A callback may have admitted a grant before this coordinator
+                # arrived but failed to persist it. Store presence is not proof
+                # that authorization will survive the next start.
+                await self.save_tokens()
+                self.bot_authorized.set()
             return
 
-        if config.ACCESS_TOKEN and config.REFRESH_TOKEN:
+        if self._runtime.ACCESS_TOKEN and self._runtime.REFRESH_TOKEN:
             # Seed tokens can be stale (Twitch rotates refresh tokens on every
             # refresh) or belong to the wrong account — both must fall through
             # to the browser flow rather than crash or silently half-work.
             LOGGER.info("Seeding token store from TWITCH_ACCESS_TOKEN/REFRESH_TOKEN")
             try:
-                resp = await self.add_token(config.ACCESS_TOKEN, config.REFRESH_TOKEN)
-            except Exception:
+                resp = await retry_provider(
+                    lambda: self.add_token(
+                        self._runtime.ACCESS_TOKEN, self._runtime.REFRESH_TOKEN
+                    )
+                )
+            except (ValueError, twitchio.HTTPException) as exc:
+                if transient(exc):
+                    raise
+                if isinstance(exc, twitchio.HTTPException) and exc.status not in (
+                    400,
+                    401,
+                    403,
+                ):
+                    raise
                 LOGGER.warning(
                     "Seed tokens are invalid, expired or under-scoped; "
                     "falling back to browser authorization"
@@ -440,7 +488,16 @@ class VoxBot(commands.AutoBot):
 
         # The /oauth route always runs on the adapter; see oauth_start_url for
         # why the public domain wins over localhost when one is configured.
-        url = oauth_start_url(config.OAUTH_REDIRECT_URL, config.OAUTH_PORT)
+        require_authorization = getattr(self.adapter, "authorization_required", None)
+        if callable(require_authorization):
+            require_authorization()
+            LOGGER.info("Twitch authorization required. Run ./voxer.sh setup.")
+            await self.bot_authorized.wait()
+            return
+
+        url = oauth_start_url(
+            self._runtime.OAUTH_REDIRECT_URL, self._runtime.OAUTH_PORT
+        )
         LOGGER.info("No stored Twitch token — starting one-time browser authorization")
         LOGGER.info("Authorize the bot here: %s", url)
         LOGGER.info(
@@ -463,7 +520,9 @@ class VoxBot(commands.AutoBot):
                 "manually (from the machine whose browser you want to use)"
             )
         await self.bot_authorized.wait()
-        LOGGER.info("Authorization complete — tokens saved to %s", config.TOKEN_FILE)
+        LOGGER.info(
+            "Authorization complete — tokens saved to %s", self._runtime.TOKEN_FILE
+        )
 
     async def _get_avatar_url(self, chatter: Chatter) -> str | None:
         """Fetch and cache the chatter's Twitch profile image URL.
@@ -615,52 +674,31 @@ class VoxBot(commands.AutoBot):
             await super().event_message(payload)
 
     async def event_oauth_authorized(self, payload: UserTokenPayload) -> None:
-        """Handle OAuth token authorization and subscribe to chat and channel events.
+        """Admit and persist the configured account's grant before signaling.
 
-        Fires when a broadcaster visits the twitchio built-in OAuth callback URL.
-        We register all per-broadcaster EventSub subscriptions here because we
-        now have the broadcaster's user_id from the validated token.
-
-        Args:
-            payload: OAuth authorization payload with user_id and tokens.
+        Initial subscriptions belong to the runtime startup coordinator, not
+        the callback. This method is awaited by the protected OAuth adapter.
         """
+        if self._closing:
+            raise OSError("Voxer is stopping")
         if payload.user_id != self.bot_id:
             # Twitch guarantees user_id on the authorization-code grant; this
             # guard exists because the payload type marks it optional.
             LOGGER.warning("Ignoring OAuth grant for an unconfigured account")
             return
-        validated = await self.add_token(payload.access_token, payload.refresh_token)
+        await self.add_token(payload.access_token, payload.refresh_token)
+        await self.save_tokens()
+        # Consent is complete only after the grant survives restart. The
+        # composition root is the sole owner of subscription registration.
+        self.bot_authorized.set()
 
-        if payload.user_id == self.bot_id:
-            # Unblock ensure_authorized() as soon as the token is in the store.
-            # This must happen BEFORE the persistence/subscription steps below:
-            # twitchio routes listener exceptions to event_error, so a failure
-            # after this point is logged but must not leave startup hanging on
-            # bot_authorized forever.
-            self.bot_authorized.set()
-
-        try:
-            # Persist immediately — waiting for a clean shutdown risks losing
-            # the grant (forcing the user back through the browser flow) on a
-            # crash.  A failed write is loud but non-fatal: the token still
-            # works for this run.
-            await self.save_tokens()
-        except OSError:
-            LOGGER.exception(
-                "Could not persist tokens to %s — authorization works for this "
-                "run but will be required again on the next start",
-                config.TOKEN_FILE,
-            )
-
-        if validated.user_id is not None:
-            await self.subscribe_for(validated.user_id)
-
-    async def subscribe_for(self, user_id: str) -> None:
+    async def subscribe_for(
+        self, user_id: str, *, on_chat_ready: Callable[[], None] | None = None
+    ) -> None:
         """Register all per-broadcaster EventSub subscriptions for one channel.
 
-        Called from event_oauth_authorized when a broadcaster completes the
-        OAuth flow, and from the composition root on every startup for the
-        bot's own channel (Conduit subscriptions expire after 72 hours of
+        Called by the composition root on every startup for the bot's own
+        channel (Conduit subscriptions expire after 72 hours of
         downtime, so re-subscribing on boot keeps long gaps safe; Twitch
         answers still-active subscriptions with 409 Conflict, treated as
         success below).
@@ -699,8 +737,30 @@ class VoxBot(commands.AutoBot):
             ),
         ]
         LOGGER.info("Subscribing for user: %s", user_id)
-        resp: MultiSubscribePayload = await self.multi_subscribe(subs)
+
+        # Mandatory chat is registered separately: optional paid-channel events
+        # must not prevent a non-affiliate channel from becoming ready.
+        async def required_chat() -> None:
+            result = await self.multi_subscribe(subs[:1])
+            _, errors = classify_subscribe_errors(result.errors)
+            if errors:
+                raise errors[0].error
+
+        await retry_provider(required_chat)
+        if on_chat_ready is not None:
+            on_chat_ready()
+        try:
+            resp: MultiSubscribePayload = await retry_provider(
+                lambda: self.multi_subscribe(subs[1:])
+            )
+        except Exception as exc:
+            if not transient(exc) and not isinstance(exc, twitchio.HTTPException):
+                raise
+            self.optional_subscription_failures = len(subs) - 1
+            LOGGER.warning("Optional Twitch events unavailable; chat remains active")
+            return
         duplicates, failures = classify_subscribe_errors(resp.errors)
+        self.optional_subscription_failures = len(failures)
         if duplicates:
             LOGGER.debug(
                 "%d subscription(s) already active for user %s",
@@ -709,7 +769,7 @@ class VoxBot(commands.AutoBot):
             )
         if failures:
             LOGGER.warning(
-                "Failed to subscribe to: %r, for user: %s", failures, user_id
+                "%d optional Twitch subscriptions unavailable", len(failures)
             )
 
     async def add_token(self, token: str, refresh: str) -> ValidateTokenPayload:
@@ -735,7 +795,7 @@ class VoxBot(commands.AutoBot):
             resp: ValidateTokenPayload = await super().add_token(token, refresh)
             if (
                 resp.user_id != self.bot_id
-                or resp.client_id != config.CLIENT_ID
+                or resp.client_id != self._runtime.CLIENT_ID
                 or not set(OAUTH_SCOPES.selected).issubset(resp.scopes)
             ):
                 if resp.user_id is None:

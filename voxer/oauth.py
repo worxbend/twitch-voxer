@@ -5,12 +5,16 @@ import logging
 import secrets
 import time
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from urllib.parse import urlencode, urlsplit
 
 from aiohttp import ClientError, web
 from twitchio import HTTPException, Scopes
 from twitchio.web import AiohttpAdapter
+from twitchio.authentication import UserTokenPayload
 from twitchio.web.utils import FetchTokenPayload
+
+from .twitch_transport import validate_oauth_token
 
 LOGGER = logging.getLogger(__name__)
 STATE_TTL_SECONDS = 300
@@ -30,9 +34,11 @@ class SecureOAuthAdapter(AiohttpAdapter):
         scopes: Scopes,
         host: str,
         port: int,
+        authorize: Callable[[UserTokenPayload], Awaitable[None]] | None = None,
     ) -> None:
         parsed = urlsplit(redirect_url)
         self._registered_redirect = redirect_url
+        self._authorize = authorize
         self._expected_user_id = expected_user_id
         self._client_id = client_id
         self._required_scopes = scopes
@@ -44,6 +50,11 @@ class SecureOAuthAdapter(AiohttpAdapter):
             domain=parsed.netloc if parsed.scheme == "https" else None,
             redirect_path=parsed.path,
         )
+        # TwitchIO strips trailing slashes; a registered callback must remain
+        # byte-for-byte reachable, including the browser state's cookie path.
+        if parsed.path and parsed.path != self._redirect_path:
+            self.router.add_get(parsed.path, self.oauth_callback)
+            self._redirect_path = parsed.path
 
     @property
     def redirect_url(self) -> str:
@@ -107,7 +118,7 @@ class SecureOAuthAdapter(AiohttpAdapter):
             browser_nonce,
             max_age=STATE_TTL_SECONDS,
             httponly=True,
-            secure=self._registered_redirect.startswith("https://"),
+            secure=urlsplit(self._registered_redirect).scheme == "https",
             samesite="Lax",
             path=self._redirect_path,
         )
@@ -159,7 +170,9 @@ class SecureOAuthAdapter(AiohttpAdapter):
                 payload = await self.client._http.user_access_token(
                     request.query["code"], redirect_uri=self._registered_redirect
                 )
-                validated = await self.client._http.validate_token(payload.access_token)
+                validated = await validate_oauth_token(
+                    self.client, payload.access_token
+                )
         except HTTPException, ClientError, TimeoutError:
             LOGGER.warning("Twitch OAuth token exchange failed")
             return FetchTokenPayload(
@@ -180,9 +193,24 @@ class SecureOAuthAdapter(AiohttpAdapter):
             )
         payload.user_id = validated.user_id
         payload.user_login = validated.login
-        self.client.dispatch(event="oauth_authorized", payload=payload)
+        if self._authorize is not None:
+            try:
+                await self._authorize(payload)
+            except OSError, HTTPException, ClientError, ValueError:
+                LOGGER.error("Could not admit or save Twitch authorization")
+                return FetchTokenPayload(
+                    status=503,
+                    response=web.Response(
+                        status=503,
+                        text="Could not save authorization. Check state volume permissions and retry.",
+                    ),
+                )
+            text = "Authorization saved. Subscription setup is still in progress."
+        else:
+            self.client.dispatch(event="oauth_authorized", payload=payload)
+            text = "Consent received. Authorization completion is pending."
         return FetchTokenPayload(
             status=200,
-            response=web.Response(text="Authorized. You can close this page."),
+            response=web.Response(text=text),
             payload=payload,
         )

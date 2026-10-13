@@ -33,6 +33,8 @@ voxer.config), so it must be run with `-m` rather than as a bare file path —
 """
 
 import argparse
+from contextlib import contextmanager
+from collections.abc import Callable
 import datetime
 import http.server
 import secrets
@@ -80,6 +82,26 @@ TOKEN_FILE = Path(config.TOKEN_FILE)
 HTTP_TIMEOUT = (5, 30)
 MAX_PAGES = 1000
 MAX_CHANNELS = 10000
+_runtime_settings: config.RuntimeSettings | None = None
+_maintenance_owner: TokenFileLock | None = None
+
+
+@contextmanager
+def _token_ownership():
+    if _maintenance_owner is not None:
+        _maintenance_owner.acquire()
+        yield
+    else:
+        with TokenFileLock(TOKEN_FILE):
+            yield
+
+
+def _configured_username() -> str:
+    return (
+        _runtime_settings.BOT_USERNAME
+        if _runtime_settings is not None
+        else config.BOT_USERNAME
+    )
 
 
 def _get(session: requests.Session, url: str, **kwargs) -> requests.Response:
@@ -239,7 +261,7 @@ def refresh_from_token_file(
         refresh = entry.get("refresh")
         if not isinstance(refresh, str) or not refresh:
             continue
-        with TokenFileLock(TOKEN_FILE):
+        with _token_ownership():
             # Another fetcher may have refreshed between the first read and lock.
             latest = read_tokens(TOKEN_FILE)
             current = latest.get(user_id)
@@ -279,7 +301,7 @@ def refresh_user_token(session: requests.Session) -> str | None:
     """
     if not REFRESH_TOKEN:
         return None
-    with TokenFileLock(TOKEN_FILE):
+    with _token_ownership():
         fresh = _refresh_grant(session, REFRESH_TOKEN)
         return _store_grant(session, fresh) if fresh else None
 
@@ -302,8 +324,8 @@ def validate_token_scopes(
     if expected_user_id is not None and data["user_id"] != expected_user_id:
         return set()
     if (
-        config.BOT_USERNAME
-        and data.get("login", "").casefold() != config.BOT_USERNAME.casefold()
+        _configured_username()
+        and data.get("login", "").casefold() != _configured_username().casefold()
     ):
         return set()
     scopes = data.get("scopes", [])
@@ -334,7 +356,7 @@ def token_has_scopes(
 
 def oauth_flow(session: requests.Session) -> str:
     """Authorize and persist credentials while excluding concurrent bot refreshes."""
-    with TokenFileLock(TOKEN_FILE):
+    with _token_ownership():
         return _oauth_flow_locked(session)
 
 
@@ -447,7 +469,7 @@ def _oauth_flow_locked(session: requests.Session) -> str:
     return _store_grant(session, resp.json())
 
 
-def get_user_token(session: requests.Session) -> str:
+def get_user_token(session: requests.Session, *, stored_only: bool = False) -> str:
     """Return a valid user token with the required scopes.
 
     Strategy:
@@ -459,16 +481,21 @@ def get_user_token(session: requests.Session) -> str:
     """
     # Lazy callables: a later source must not be refreshed (Twitch rotates the
     # refresh token on every use) when an earlier one already succeeded.
-    sources = (
-        (f"token file {TOKEN_FILE}", refresh_from_token_file),
-        ("TWITCH_REFRESH_TOKEN", refresh_user_token),
-    )
+    sources: list[tuple[str, Callable[[requests.Session], str | None]]] = [
+        (f"token file {TOKEN_FILE}", refresh_from_token_file)
+    ]
+    if not stored_only:
+        sources.append(("TWITCH_REFRESH_TOKEN", refresh_user_token))
     for source, fetch in sources:
         token = fetch(session)
         if not token:
             continue
         print(f"  Using validated token from {source}")
         return token
+    if stored_only:
+        raise RuntimeError(
+            "No reusable grant. Start Voxer and run ./voxer.sh setup, then stop it before refreshing emotes."
+        )
     print("  No reusable token found. Running OAuth flow...")
     return oauth_flow(session)
 
@@ -487,8 +514,8 @@ def get_current_user(session: requests.Session, token: str) -> dict:
     resp.raise_for_status()
     user = resp.json()["data"][0]
     if (
-        config.BOT_USERNAME
-        and user["login"].casefold() != config.BOT_USERNAME.casefold()
+        _configured_username()
+        and user["login"].casefold() != _configured_username().casefold()
     ):
         raise RuntimeError(
             "Authorize the configured bot account before fetching emotes"
@@ -595,13 +622,50 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="also scan follower channels (potentially many API requests)",
     )
+    parser.add_argument(
+        "--stored-only",
+        action="store_true",
+        help="reuse Voxer's primary setup; never open the legacy port-1337 OAuth flow",
+    )
     args = parser.parse_args(argv)
-    # Only the two application credentials — deliberately not the bot's whole
-    # configuration.  config.validate_config() would additionally require
-    # TWITCH_BOT_USERNAME and a working OAuth redirect URL, and this script
-    # uses neither: it talks to the Twitch API directly and, when it needs a
-    # user token, runs its own local callback server on REDIRECT_URI above.
-    config.validate_credentials()
+    global CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN, OUTPUT_FILE, TOKEN_FILE
+    global _runtime_settings, _maintenance_owner
+    settings = config.load_settings()
+    config.validate_credentials(settings)
+    previous = (
+        CLIENT_ID,
+        CLIENT_SECRET,
+        REFRESH_TOKEN,
+        OUTPUT_FILE,
+        TOKEN_FILE,
+        _runtime_settings,
+    )
+    try:
+        _runtime_settings = settings
+        CLIENT_ID, CLIENT_SECRET = settings.CLIENT_ID, settings.CLIENT_SECRET
+        REFRESH_TOKEN = settings.REFRESH_TOKEN
+        OUTPUT_FILE, TOKEN_FILE = (
+            Path(settings.EMOTES_DB_PATH),
+            Path(settings.TOKEN_FILE),
+        )
+        with TokenFileLock(TOKEN_FILE) as owner:
+            _maintenance_owner = owner
+            try:
+                _fetch(args)
+            finally:
+                _maintenance_owner = None
+    finally:
+        (
+            CLIENT_ID,
+            CLIENT_SECRET,
+            REFRESH_TOKEN,
+            OUTPUT_FILE,
+            TOKEN_FILE,
+            _runtime_settings,
+        ) = previous
+
+
+def _fetch(args: argparse.Namespace) -> None:
     # parents=True because the path is configurable: a value such as
     # VOXER_EMOTES_DB_PATH=/data/voxer/emotes/emotes.db nests more than one
     # level deep, and without it the very first run on a fresh volume would
@@ -613,7 +677,7 @@ def main(argv: list[str] | None = None) -> None:
         app_token = get_app_token(session)
 
         print("Getting user token...")
-        user_token = get_user_token(session)
+        user_token = get_user_token(session, stored_only=args.stored_only)
 
         print("Getting current user...")
         user = get_current_user(session, user_token)

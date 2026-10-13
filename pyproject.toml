@@ -25,7 +25,7 @@ build-backend = "hatchling.build"
 packages = ["voxer"]
 
 [project.scripts]
-twitch-voxer       = "voxer.app:main"
+twitch-voxer       = "voxer.bootstrap:main"
 voxer-fetch-emotes = "voxer.fetch_emotes:main"
 
 [tool.ruff]
@@ -43,6 +43,7 @@ typeCheckingMode  = "standard"
 [dependency-groups]
 dev = [
     "httpx>=0.28",
+    "playwright==1.63.0",
     "pyright>=1.1",
     "pytest>=8",
     "pytest-asyncio>=0.24",

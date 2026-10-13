@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock, Mock
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
-from aiohttp.test_utils import make_mocked_request
+from aiohttp import CookieJar
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from twitchio import Scopes
 
 from voxer.oauth import MAX_PENDING_STATES, STATE_COOKIE, SecureOAuthAdapter
@@ -109,6 +110,31 @@ async def test_wrong_identity_or_scope_is_not_dispatched(invalid):
 
 
 @pytest.mark.asyncio
+async def test_callback_waits_for_durable_admission_and_reports_write_failure():
+    adapter = make_adapter()
+    adapter._authorize = AsyncMock(side_effect=PermissionError("private-token-path"))
+    state, cookie = await begin(adapter)
+    response = await adapter.oauth_callback(callback(state, cookie))
+    assert response.status == 503
+    assert "private-token-path" not in response.text
+    adapter._authorize.assert_awaited_once()
+    adapter.client.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_callback_success_waits_for_durable_admission():
+    adapter = make_adapter()
+    adapter._authorize = AsyncMock()
+    state, cookie = await begin(adapter)
+    response = await adapter.oauth_callback(callback(state, cookie))
+    assert response.status == 200
+    assert "saved" in response.text
+    assert "Subscription setup is still in progress" in response.text
+    adapter._authorize.assert_awaited_once()
+    adapter.client.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_oauth_start_rejects_host_injection():
     adapter = make_adapter()
     request = make_mocked_request("GET", "/oauth", headers={"Host": "evil.example"})
@@ -127,8 +153,9 @@ async def test_oauth_pending_state_is_bounded():
 
 
 @pytest.mark.asyncio
-async def test_public_callback_cookie_is_secure_and_port_is_preserved():
-    adapter = make_adapter("https://bot.example:8443/custom/callback")
+@pytest.mark.parametrize("scheme", ["https", "HTTPS"])
+async def test_public_callback_cookie_is_secure_and_port_is_preserved(scheme):
+    adapter = make_adapter(f"{scheme}://bot.example:8443/custom/callback")
     request = make_mocked_request("GET", "/oauth", headers={"Host": "bot.example:8443"})
     response = await adapter.oauth_redirect(request)
     cookie = response.cookies[STATE_COOKIE]
@@ -136,3 +163,21 @@ async def test_public_callback_cookie_is_secure_and_port_is_preserved():
     assert cookie["httponly"]
     assert cookie["samesite"] == "Lax"
     assert cookie["path"] == "/custom/callback"
+
+
+@pytest.mark.asyncio
+async def test_registered_trailing_slash_reaches_callback_with_browser_cookie():
+    adapter = make_adapter("http://localhost:4343/oauth/callback/")
+    client = TestClient(TestServer(adapter), cookie_jar=CookieJar(unsafe=True))
+    await client.start_server()
+    client.session.headers["Host"] = "localhost:4343"
+    try:
+        response = await client.get("/oauth", allow_redirects=False)
+        state = parse_qs(urlsplit(response.headers["Location"]).query)["state"][0]
+        response = await client.get(
+            "/oauth/callback/", params={"state": state, "code": "synthetic"}
+        )
+        assert response.status == 200
+        adapter.client.dispatch.assert_called_once()
+    finally:
+        await client.close()

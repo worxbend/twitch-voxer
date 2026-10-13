@@ -493,10 +493,17 @@ class TestDispatch:
         try:
             await asyncio.wait_for(entered.wait(), timeout=5)
             pending.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await pending
+            await asyncio.sleep(0)
+            assert not pending.done(), (
+                "Shutdown must retain ownership until native synthesis finishes"
+            )
+            pending.cancel()  # Repeated cancellation cannot abandon native work.
+            await asyncio.sleep(0)
+            assert not pending.done()
         finally:
             release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
         assert await asyncio.to_thread(written.wait, 5)
         for _ in range(100):
             if not wav.exists():

@@ -14,7 +14,6 @@ __pycache__/
 .ruff_cache/
 
 # Docs and repo metadata not needed inside the image
-README.md
 assets/
 renovate.json
 docker-compose.yml
@@ -31,3 +30,25 @@ audio/**/*.mp3
 # emotes.db is generated locally by voxer/fetch_emotes.py (it is gitignored);
 # only the bundled sound files are baked into the image.
 emotes/emotes.db
+
+# Public-image allowlist: clips without supplied redistribution rights must
+# never enter a context/image layer. Private custom mounts remain supported.
+voxer/sounds/*.mp3
+!voxer/sounds/pop.mp3
+!voxer/sounds/zap.mp3
+!voxer/sounds/sparkle.mp3
+!voxer/sounds/ding.mp3
+!voxer/sounds/crunch.mp3
+!voxer/sounds/chirp.mp3
+!voxer/sounds/choo-choo.mp3
+!voxer/sounds/splash.mp3
+!voxer/sounds/tweet.mp3
+!voxer/sounds/boing.mp3
+!voxer/sounds/hush.mp3
+!voxer/sounds/ribbit.mp3
+!voxer/sounds/doki-doki.mp3
+!voxer/sounds/wan-wan.mp3
+!voxer/sounds/noted.mp3
+!voxer/sounds/bang.mp3
+!voxer/sounds/beep.mp3
+tasks/

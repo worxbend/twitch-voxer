@@ -110,6 +110,11 @@ class TestHandlers:
             "client_secret=topsecret",
             "token=topsecret",
             "Authorization: Bearer topsecret",
+            "https://id.twitch.tv/oauth2/token?code=topsecret&client_id=public",
+            "state=topsecret",
+            "'refresh': 'topsecret'",
+            "'secret': 'topsecret'",
+            "http://localhost:4343/setup?key=topsecret",
         ],
     )
     def test_credentials_are_redacted_after_formatting(self, secret_text) -> None:

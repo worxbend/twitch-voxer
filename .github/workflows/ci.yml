@@ -56,3 +56,25 @@ jobs:
 
       - name: Test overlay playback
         run: node tests/test_overlay.cjs
+
+      - name: Install Chromium for setup regression
+        run: uv run --frozen python -m playwright install --with-deps chromium
+
+      - name: Test browser enrollment with local synthetic OAuth
+        run: uv run --frozen python tests/browser_setup.py
+
+  container:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the runtime image on the native architecture
+        run: docker build -t twitch-voxer:ci .
+      - name: Test fresh volumes, private state, recreation and setup shutdown
+        run: python3 tests/container_smoke.py twitch-voxer:ci
+      # Publishing remains a separate, explicitly approved release action.

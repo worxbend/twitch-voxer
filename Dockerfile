@@ -4,11 +4,11 @@
 # uv cache, or build tooling — only Python, ffmpeg, the venv, and the app.
 
 # ── Stage 1: build the virtual environment ────────────────────────────────────
-FROM python:3.14-slim-bookworm AS builder
+FROM python:3.14-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83 AS builder
 
 # uv is a fast Python package installer; pin the major/minor version so
 # builds stay reproducible.
-COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.9@sha256:538e0b39736e7feae937a65983e49d2ab75e1559d35041f9878b7b7e51de91e4 /uv /usr/local/bin/uv
 
 # UV_COMPILE_BYTECODE: pre-compile .pyc files so container startup is faster.
 # UV_LINK_MODE=copy: copy files instead of hardlinking (hardlinks don't work
@@ -28,8 +28,15 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --no-dev
 
+# Install the application non-editably so maintenance console scripts work.
+# Source changes invalidate only this layer, not dependency resolution above.
+COPY README.md ./
+COPY voxer/ voxer/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-editable
+
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
-FROM python:3.14-slim-bookworm
+FROM python:3.14-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83
 
 # ffmpeg is needed to encode the generated speech to MP3.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -71,7 +78,7 @@ USER voxer
 EXPOSE 8080 4343
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
-    CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+    CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4343/healthz', timeout=3)"]
 
 # Run the venv's python directly as PID 1 (no uv wrapper in the runtime image).
-CMD ["python", "main.py"]
+CMD ["python", "-m", "voxer.bootstrap"]

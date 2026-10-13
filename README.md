@@ -38,88 +38,70 @@ Keep your eyes on the game and your ears on chat. Voxer turns Twitch messages in
 <a name="quick-start"></a>
 <h2 align="center">🚀 Quick Start</h2>
 
-For a local install, you'll need [uv](https://docs.astral.sh/uv/getting-started/installation/), Python **3.14**, and **ffmpeg**. uv can [install Python for you](https://docs.astral.sh/uv/guides/install-python/). Install ffmpeg with your package manager, such as `sudo apt install ffmpeg` on Ubuntu or `brew install ffmpeg` on macOS.
-
-Prefer containers? Create your Twitch application below, then jump to [Docker](#docker).
-
-<h3 align="center">1 · Connect your Twitch account</h3>
-
-1. Open the [Twitch Developer Console](https://dev.twitch.tv/console/apps) and register an application. Twitch requires a verified email and two-factor authentication; see its [registration guide](https://dev.twitch.tv/docs/authentication/register-app/).
-2. Set the OAuth redirect URL to **`http://localhost:4343/oauth/callback`**.
-3. Open **Manage** for your application. Copy the **Client ID** and create a **Client Secret**.
-
-<h3 align="center">2 · Install and configure</h3>
+Install Docker with **Compose 2.24 or later** on Linux or macOS, then:
 
 ```bash
-git clone https://github.com/w0rxbend/twitch-voxer.git
+git clone https://github.com/worxbend/twitch-voxer.git
 cd twitch-voxer
-uv python install 3.14
-uv sync --locked
-cp .env.example .env
-mkdir -p data
+./voxer.sh start
 ```
 
-Fill in these three values in `.env`:
+The first start builds a local image and opens a private setup page in your **host browser**. No host Python, ffmpeg, `.env`, manual UID preparation, or token copying is needed. In a headless session, the launcher prints a single-use setup link; open it on the Docker host and keep it private.
 
-```dotenv
-TWITCH_CLIENT_ID=your_client_id
-TWITCH_CLIENT_SECRET=your_client_secret
-TWITCH_BOT_USERNAME=your_channel_login
-```
+1. Create an application in the [Twitch Developer Console](https://dev.twitch.tv/console/apps). Twitch requires a verified email and two-factor authentication; see its [registration guide](https://dev.twitch.tv/docs/authentication/register-app/).
+2. Register **`http://localhost:4343/oauth/callback`** as its exact redirect URL.
+3. Enter only the **Client ID** and **Client Secret** in Voxer's setup page.
+4. Approve Twitch access using your **streaming/channel account**, then confirm the channel shown by Voxer. This remains a one-account/one-channel application, not a separate bot account.
+5. Refresh the setup page while the speech model prepares. When it says **ready**, copy its generated **OBS Browser Source URL**. The overlay secret is generated once and retained across restarts.
 
-Leave the access and refresh token fields empty for the normal browser sign-in flow. Keep `.env` and `data/tokens.json` private.
-
-**Before you start:** review [data/messages.json](data/messages.json). Its messages are posted to your chat, beginning after the startup delay. To disable reminders, replace its contents with:
-
-```json
-{"messages": []}
-```
-
-<h3 align="center">3 · Go live with Voxer</h3>
-
-```bash
-uv run --frozen twitch-voxer
-```
-
-Open the authorization URL shown in the terminal, usually **`http://localhost:4343/oauth`**, and sign in as the account configured above. Saved tokens are refreshed automatically and survive restarts; you may need to authorize again if access is revoked.
-
-The first run downloads the speech model. Once startup completes, add **`http://localhost:8080/simple`** as an OBS browser source using the [setup below](#obs). Keep an overlay connected and send a message from another Twitch account to hear it speak.
+For each later stream, run **`./voxer.sh start`**. It reuses the installed image, saved configuration, Twitch grant, and model cache; it neither builds nor pulls an image when the selected image is present. Repeated starts do not reopen your browser. Scheduled chat messages are **off by default**.
 
 <a name="docker"></a>
-<h2 align="center">🐳 Run with Docker</h2>
-
-Docker includes Python and ffmpeg. Clone the repository, enter its directory, copy `.env.example` to `.env`, and fill in the same three Twitch settings from [Quick Start](#quick-start).
-
-Generate a separate overlay secret:
+<h2 align="center">🐳 Docker controls and storage</h2>
 
 ```bash
-docker run --rm python:3.14-slim python -c "import secrets; print(secrets.token_urlsafe(32))"
+./voxer.sh status    # authorization, model, chat and OBS connection status
+./voxer.sh stop      # retain settings and cache
+./voxer.sh setup     # open a fresh private setup/reauthorization session
+./voxer.sh prepare   # prepare the speech cache while Voxer is stopped
+./voxer.sh emotes    # refresh emotes while stopped; reuse primary authorization
 ```
 
-Paste the result into `.env` as `VOXER_OVERLAY_TOKEN`. This is required by the container configuration; use a fresh secret, separate from your Twitch credentials.
+Keep the setup page open during first preparation; **Refresh status** shows progress and the OBS URL. If setup reports an error, fix the indicated component and stop/start to retry. Temporary Twitch outages retain your saved grant and retry within a bounded budget, rather than sending you straight back to consent. Genuine revoked permissions require `./voxer.sh setup`.
 
-```dotenv
-VOXER_OVERLAY_TOKEN=paste_the_generated_value_here
+Compose publishes ports **8080** and **4343** on host loopback only. Private settings, tokens, voice assignments, reminders and emote cache live in the **`voxer-state` named volume** at `/data`. The speech model lives in **`tts-cache`**; generated audio uses bounded `/tmp` storage. Files containing credentials have mode `0600`. These files are plaintext: protect the volumes and their backups. **Do not use `docker compose down -v` unless you intend to erase them.**
+
+The default image is **`twitch-voxer:local`**, not a published release. After changing source, explicitly rebuild with `docker compose build voxer`, then stop/start. You can select a separately supplied versioned image with `VOXER_IMAGE`; `./voxer.sh update` pulls that selection explicitly. Keep the previous image tag/digest for rollback. Public release publication, ARM64 execution, real Twitch/OBS checks, and stream-ready latency benchmarks are still pending; see [implementation status](tasks/implementation.md).
+
+<details>
+<summary><strong>Existing .env/bind mounts and local development</strong></summary>
+
+Existing environment variables and `.env` files remain supported. Precedence is **environment > `.env` > saved setup > defaults**. An explicit blank or invalid override is not silently replaced. For browser enrollment, do not copy an example containing blank credential overrides into `.env`; either supply working values there or leave those keys absent.
+
+Existing `./data` deployments are **not automatically migrated**. Stop the old service and keep its files. To retain a bind mount, create `compose.bind.yml`:
+
+```yaml
+services:
+  voxer:
+    volumes:
+      - ./data:/data
 ```
 
-Review or disable the scheduled messages as described above, then start the service:
+Start with `docker compose -f docker-compose.yml -f compose.bind.yml up -d --build`; this replaces only the `/data` mount. Bind-mounted files must remain writable/readable by **UID 1000**. Never use broad `chmod 777` or overwrite an existing named-volume backup. The launcher uses the default named-volume configuration, so use the same explicit Compose files for controls in an advanced deployment.
+
+For local development, install [uv](https://docs.astral.sh/uv/) and ffmpeg, then:
 
 ```bash
-mkdir -p data
-docker compose up -d --build
-docker compose logs -f voxer
+uv python install 3.14
+uv sync --locked
+uv run --frozen twitch-voxer
+# In another terminal, obtain a private browser setup URL:
+uv run --frozen python -m voxer.control setup-url
 ```
 
-On Linux, `data/` must be writable by the container's user, **UID 1000**. Open the authorization URL from the logs on the Docker host and approve your Twitch account. Use **`http://localhost:8080/simple?token=YOUR_TOKEN`** in OBS.
+Local state defaults to `data/settings.json` and `data/tokens.json`. Use the setup page's protected OBS URL even for local installs. Change saved application credentials only while stopped; `.env`/environment overrides remain available for advanced configuration. For remote Docker, deliberately configure HTTPS or a local tunnel; the automatic launcher assumes Docker and your browser share a host.
 
-The supplied Compose configuration publishes ports **8080** and **4343** on localhost only. Your settings and tokens persist in `./data`; the downloaded model persists in a named Docker volume. Custom voice files and emote sounds are bundled in the image. Uncomment the corresponding mounts in [docker-compose.yml](docker-compose.yml) to use your own local copies.
-
-| Task | Command |
-| :--- | :--- |
-| View logs | `docker compose logs -f voxer` |
-| Stop | `docker compose down` |
-| Apply `.env` changes | `docker compose up -d --force-recreate` |
-| Update | `git pull --ff-only`, then `docker compose up -d --build` |
+</details>
 
 <a name="obs"></a>
 <h2 align="center">🎬 Add It to OBS</h2>
@@ -256,8 +238,11 @@ the entire name or alias; use another command or `!end` before adding prose.
 | `womp` | `womp womp`, `womp womp womp` |
 
 `doki doki` plays a heartbeat, `wan wan` plays barking, and `noted` plays a
-notification. All 49 clips are bundled for offline playback,
-including Docker and installed Python packages. See [sound sources and credits](voxer/sounds/README.md)
+notification. The source checkout includes all 49 clips. The Docker context
+includes only the 17 effects with supplied CC0 attribution; mount a private
+custom sounds directory to use the other 32 clips after confirming your rights.
+Do not publicly redistribute those clips or an unfiltered Python wheel without
+license review. See [sound sources and credits](voxer/sounds/README.md)
 for the original recordings and licenses.
 
 A chat message's commands share one cooldown check and enter the queue in order.
@@ -272,7 +257,8 @@ disables these notifications. The `!s discord` command uses the clip in
 
 <h3 align="center">💬 Scheduled messages</h3>
 
-Edit [data/messages.json](data/messages.json) to choose your community reminders:
+Scheduled posting is disabled by default. Edit `VOXER_MESSAGES_PATH` to opt in:
+`/data/messages.json` inside Docker, or [data/messages.json](data/messages.json) locally:
 
 ```json
 {
@@ -291,13 +277,15 @@ Use `{"messages": []}` to disable posting. `VOXER_SCHEDULER_INITIAL_DELAY` defau
 
 Each new chatter receives a random voice from **M1–M5**, **F1–F5**, and the custom styles in [voices/](voices/). Assignments are saved in `data/voices.json`. Add compatible Supertonic voice-style JSON files to `voices/` and restart to expand the pool.
 
-To populate emote images, stop Voxer and run the cache fetcher from a local installation:
+To populate emote images in Docker:
 
 ```bash
-uv run --frozen voxer-fetch-emotes
+./voxer.sh stop
+./voxer.sh emotes
+./voxer.sh start
 ```
 
-It reuses your saved Twitch authorization, so run it while the service is stopped. It fetches global emotes and emotes from your own and followed channels; `--include-followers` also scans follower channels. Restart Voxer to load the resulting `emotes/emotes.db` cache. For Docker, enable the `./emotes:/app/emotes:ro` mount after generating the cache on the host.
+The cache remains in `/data/emotes.json`. Maintenance holds the same exclusive token lease as the bot and never opens a second OAuth callback. If the grant needs consent, start Voxer, run `./voxer.sh setup`, then stop it before maintenance. A failed fetch preserves the old cache. Locally use `uv run --frozen voxer-fetch-emotes --stored-only`; the legacy standalone flow remains available without that flag. `--include-followers` opts into scanning follower channels.
 
 <details>
 <summary><strong>📁 Storage paths and backups</strong></summary>
@@ -307,6 +295,7 @@ It reuses your saved Twitch authorization, so run it while the service is stoppe
 | `VOXER_DB_PATH` | `data/voices.json` | Chatter-to-voice assignments. |
 | `VOXER_TIMESTAMPS_DB_PATH` | `data/timestamps.json` | Recent announcement timestamps. |
 | `VOXER_TOKEN_FILE` | `data/tokens.json` | Private Twitch access and refresh tokens. |
+| `VOXER_SETTINGS_FILE` | `data/settings.json` | Private saved setup and independent overlay secret. |
 | `VOXER_MESSAGES_PATH` | `data/messages.json` | Scheduled chat messages. |
 | `VOXER_VOICES_DIR` | `voices` | Custom voice styles. |
 | `VOXER_EMOTES_DB_PATH` | `emotes/emotes.db` | Generated emote-image cache. |
@@ -335,7 +324,7 @@ Back up the `data/` directory securely to preserve your settings and authorizati
 | `VOXER_OAUTH_PORT` | `4343` | Authorization callback port. |
 | `VOXER_OAUTH_REDIRECT_URL` | `http://localhost:4343/oauth/callback` | Must exactly match the registered Twitch redirect URL. Non-localhost callbacks require HTTPS. |
 
-Keep audio lifetimes long enough for queued playback. The `/healthz` endpoint reports HTTP service liveness; it does not confirm Twitch authorization or speech readiness.
+Keep audio lifetimes long enough for queued playback. Control port **4343** serves `/healthz` during setup/preparation and secret-free `/readyz` (**503** until authorization, model and mandatory chat are usable). The overlay listener also exposes these endpoints after model initialization. Missing OBS alone does not fail readiness. Detailed status requires a private browser session or the local control command.
 
 </details>
 
@@ -369,9 +358,9 @@ If you also proxy authorization, register the exact HTTPS callback URL in Twitch
 | Overlay says unauthorized | Use `?token=YOUR_TOKEN` with the current overlay secret. |
 | Invalid host | Add the hostname from your OBS URL to `VOXER_ALLOWED_HOSTS`, without a scheme or port. |
 | Twitch authorization fails | Check the Client ID, secret, exact callback URL, and that you signed in as `TWITCH_BOT_USERNAME`. |
-| Docker cannot save settings | Check that `data/` exists and is writable by UID 1000. |
+| Docker cannot save settings | Check the named volume; for advanced bind mounts, check UID 1000 access. Do not erase saved grants to fix a network timeout. |
 | Speech trails behind chat | Lower the queue size or maximum message age, or increase the per-user cooldown. |
-| No emote images | Generate the emote cache, mount it if using Docker, then restart. |
+| No emote images | Stop, run `./voxer.sh emotes`, then start again. |
 | Speech conversion fails | Confirm `ffmpeg` is available on your PATH. |
 
 For more detail, set `VOXER_LOG_LEVEL=DEBUG` and restart. You can also [open an issue](https://github.com/w0rxbend/twitch-voxer/issues) with the relevant error and steps to reproduce it; leave out secrets and private state files.
@@ -386,6 +375,11 @@ uv run --frozen ruff format --check
 uv run --frozen pyright
 uv run --frozen pytest -q
 node tests/test_overlay.cjs
+uv run --frozen python -m playwright install chromium
+uv run --frozen python tests/browser_setup.py
+uv run --frozen python tests/browser_overlay.py
+docker build -t twitch-voxer:local .
+python3 tests/container_smoke.py twitch-voxer:local
 ```
 
 Optional browser checks for both overlays:

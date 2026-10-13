@@ -1,10 +1,27 @@
 """Private, atomic credential storage with one refresh owner per token file."""
 
+import asyncio
 import json
 import os
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from typing import TypeVar
 from pathlib import Path
+
+
+T = TypeVar("T")
+
+
+async def run_durable(
+    operation: Callable[..., T], *args: object, **kwargs: object
+) -> T:
+    """Finish non-abandonable thread work before cancellation releases ownership."""
+    task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
 
 
 class TokenFileBusyError(RuntimeError):
@@ -40,7 +57,8 @@ class TokenFileLock:
             os.close(fd)
             raise TokenFileBusyError(
                 f"Tokens in {self.path} are managed by another process. "
-                "Stop the bot before refreshing emotes, then restart it."
+                "Stop the bot in the other process before starting this one or "
+                "refreshing emotes, then retry."
             ) from exc
         self._fd = fd
 

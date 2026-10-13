@@ -8,7 +8,53 @@ precisely so that this part can be.
 
 from pathlib import Path
 
+import asyncio
+import os
+import subprocess
+import sys
+
+import pytest
+
+from voxer import app
 from voxer.app import _prepare_runtime_dirs
+from voxer.config import RuntimeSettings
+from voxer.token_store import TokenFileBusyError, TokenFileLock
+
+
+@pytest.mark.asyncio
+async def test_second_process_cannot_sweep_or_load_model(tmp_path, monkeypatch):
+    token_file = tmp_path / "tokens.json"
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    clip = audio_dir / "playing.mp3"
+    clip.write_bytes(b"playing")
+    settings = RuntimeSettings.from_env(
+        {"VOXER_TOKEN_FILE": str(token_file), "VOXER_AUDIO_DIR": str(audio_dir)}
+    )
+    monkeypatch.setattr(app, "validate_config", lambda _: None)
+    monkeypatch.setattr(app, "setup_logging", lambda _: None)
+    monkeypatch.setattr(app, "TTSService", lambda **_: pytest.fail("loaded model"))
+    code = (
+        "import sys; from voxer.token_store import TokenFileLock; "
+        "lock=TokenFileLock(sys.argv[1]); lock.acquire(); "
+        "print('locked', flush=True); sys.stdin.read()"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", code, str(token_file)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(Path.cwd())},
+    )
+    try:
+        assert await asyncio.to_thread(process.stdout.readline) == "locked\n"
+        with pytest.raises(TokenFileBusyError, match="another process"):
+            await app.run(settings)
+        assert clip.read_bytes() == b"playing"
+    finally:
+        process.communicate(timeout=5)
+    with TokenFileLock(token_file):
+        pass
 
 
 class TestPrepareRuntimeDirs:

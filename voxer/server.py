@@ -95,7 +95,7 @@ class _OverlayAccess:
             await self._deny(scope, receive, send, 403)
             return
 
-        if self.token and scope["path"] != "/healthz":
+        if self.token and scope["path"] not in {"/healthz", "/readyz"}:
             auth = conn.headers.get("authorization", "")
             bearer = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else ""
             authenticated = self._matches(bearer) or self._matches(
@@ -244,8 +244,10 @@ class AudioServer:
         max_pending_per_client: int = 64,
         audio_max_age: float = 300,
         trusted_proxies: tuple[str, ...] = (),
+        readiness: Callable[[], bool] = lambda: False,
     ) -> None:
         self._audio_dir = audio_dir
+        self._readiness = readiness
         self._host = host
         self._port = port
         self._send_timeout = send_timeout
@@ -266,6 +268,7 @@ class AudioServer:
                 Route("/simple", self._handle_simple),
                 Route("/favicon.ico", self._handle_favicon),
                 Route("/healthz", self._handle_health),
+                Route("/readyz", self._handle_ready),
                 WebSocketRoute("/ws", self._handle_ws),
                 Mount("/static", StaticFiles(directory=_STATIC_DIR)),
                 Route(f"{AUDIO_URL_PREFIX}/{{filename}}", self._handle_audio),
@@ -298,6 +301,14 @@ class AudioServer:
 
     async def _handle_health(self, request: Request) -> Response:
         return Response(content="ok", media_type="text/plain")
+
+    async def _handle_ready(self, request: Request) -> Response:
+        ready = self._readiness()
+        return Response(
+            content="ready" if ready else "not ready",
+            status_code=200 if ready else 503,
+            media_type="text/plain",
+        )
 
     async def _handle_audio(self, request: Request) -> Response:
         path = resolve_audio_file(self._audio_dir, request.path_params["filename"])

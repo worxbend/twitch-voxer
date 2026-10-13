@@ -23,6 +23,12 @@ emotes/all_emotes.json
 # hourly, so without this rule a "git add -A" after any run publishes them.
 data/tokens.json
 data/tokens.tmp
+data/tokens.json.lock
+data/settings.json
+data/control.json
+data/.settings.json.*
+data/.tokens.json.*
+data/.control.json.*
 
 # Coverage output
 .coverage

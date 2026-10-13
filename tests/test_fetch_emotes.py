@@ -143,15 +143,55 @@ def test_failed_token_write_never_prints_refresh_token(tmp_path, monkeypatch, ca
     assert "do-not-log-this-secret" not in capsys.readouterr().out
 
 
+def test_stored_only_never_opens_secondary_consent(monkeypatch):
+    monkeypatch.setattr(fetch_emotes, "refresh_from_token_file", lambda _: None)
+    oauth = Mock()
+    seed = Mock()
+    monkeypatch.setattr(fetch_emotes, "oauth_flow", oauth)
+    monkeypatch.setattr(fetch_emotes, "refresh_user_token", seed)
+    with pytest.raises(RuntimeError, match="voxer.sh setup"):
+        fetch_emotes.get_user_token(Mock(), stored_only=True)
+    oauth.assert_not_called()
+    seed.assert_not_called()
+
+
+def test_main_refuses_active_owner_before_any_provider_call(tmp_path, monkeypatch):
+    target = tmp_path / "tokens.json"
+    settings = fetch_emotes.config.RuntimeSettings.from_env(
+        {
+            "TWITCH_CLIENT_ID": "app",
+            "TWITCH_CLIENT_SECRET": "secret",
+            "VOXER_TOKEN_FILE": str(target),
+        }
+    )
+    monkeypatch.setattr(fetch_emotes.config, "load_settings", lambda: settings)
+    network = Mock()
+    monkeypatch.setattr(fetch_emotes, "get_app_token", network)
+    with TokenFileLock(target):
+        with pytest.raises(TokenFileBusyError):
+            fetch_emotes.main(["--stored-only"])
+    network.assert_not_called()
+
+
 def test_cache_is_published_as_complete_json_without_stale_entries(
     tmp_path, monkeypatch
 ):
     target = tmp_path / "emotes.json"
     target.write_text('{"stale":{}}')
     monkeypatch.setattr(fetch_emotes, "OUTPUT_FILE", target)
-    monkeypatch.setattr(fetch_emotes.config, "validate_credentials", lambda: None)
+    monkeypatch.setattr(fetch_emotes.config, "validate_credentials", lambda _: None)
+    monkeypatch.setattr(
+        fetch_emotes.config,
+        "load_settings",
+        lambda: fetch_emotes.config.RuntimeSettings.from_env(
+            {
+                "VOXER_EMOTES_DB_PATH": str(target),
+                "VOXER_TOKEN_FILE": str(tmp_path / "tokens.json"),
+            }
+        ),
+    )
     monkeypatch.setattr(fetch_emotes, "get_app_token", lambda *_: "app")
-    monkeypatch.setattr(fetch_emotes, "get_user_token", lambda *_: "user")
+    monkeypatch.setattr(fetch_emotes, "get_user_token", lambda *_, **__: "user")
     monkeypatch.setattr(
         fetch_emotes, "get_current_user", lambda *_: {"id": "123", "login": "bot"}
     )

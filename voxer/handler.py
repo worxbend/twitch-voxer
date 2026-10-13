@@ -183,7 +183,11 @@ class MessageHandler:
 
     @staticmethod
     async def _file_job(function, *args, cleanup_path: Path | None = None, **kwargs):
-        """Dispose of thread output after cancellation, when writing is finished."""
+        """Wait for non-abandonable work, then dispose of canceled output.
+
+        Keeping the coroutine alive keeps its runtime's ownership lease alive;
+        a new process must not load another model while inference still runs.
+        """
         worker = asyncio.get_running_loop().run_in_executor(
             None, partial(function, *args, **kwargs)
         )
@@ -201,7 +205,14 @@ class MessageHandler:
                     path = cleanup_path if cleanup_path is not None else Path(result)
                     path.unlink(missing_ok=True)
 
-            worker.add_done_callback(discard_result)
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            discard_result(worker)
             raise
 
     def _new_mp3_path(self) -> Path:
